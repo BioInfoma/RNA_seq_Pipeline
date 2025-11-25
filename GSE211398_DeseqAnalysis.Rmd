@@ -1,0 +1,390 @@
+---
+title: "GSE211398_race_analysis"
+author: "Temitope"
+date: "2025-11-24"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+
+## R Markdown
+
+This is dataset is gotten from the pubic dataset titled "Comparative gene expression profiling analysis of RNA-seq data for pancreatic adenocarcinoma specimens obtained from Black and White patients".	https://pubmed.ncbi.nlm.nih.gov/36812168/
+
+This analysis seek to answer the question: does the tumour effect differ by race?
+
+```{r cars}
+# 1. Load required libraries
+library(DESeq2)
+library(ggplot2)
+library(pheatmap)
+library(dplyr)
+library(ggrepel)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+```
+
+```{r}
+# 2. Read count data and convert gene IDs to symbols
+count_data <- read.delim("GSE211398_raw_counts_GRCh38.p13_NCBI.tsv", row.names = 1)
+count_data <- count_data[rowSums(count_data) > 0, ]
+
+# Convert gene IDs to symbols
+convert_gene_ids <- function(gene_ids) {
+  # Remove version numbers if present
+  clean_ids <- gsub("\\..*", "", gene_ids)
+  
+  # Map to gene symbols
+  symbols <- mapIds(org.Hs.eg.db,
+                    keys = clean_ids,
+                    column = "SYMBOL",
+                    keytype = "ENTREZID",
+                    multiVals = "first")
+  return(symbols)
+}
+```
+
+
+```{r}
+# Apply conversion
+gene_symbols <- convert_gene_ids(rownames(count_data))
+
+# Create a data frame to handle duplicates properly
+gene_mapping <- data.frame(
+  original_id = rownames(count_data),
+  symbol = gene_symbols,
+  stringsAsFactors = FALSE
+)
+
+# Remove rows where symbol conversion failed
+gene_mapping <- gene_mapping[!is.na(gene_mapping$symbol), ]
+
+# Calculate mean expression for each gene
+mean_expression <- rowMeans(count_data)
+
+# Add mean expression to mapping
+gene_mapping$mean_expr <- mean_expression[gene_mapping$original_id]
+
+# For duplicate symbols, keep the one with highest mean expression
+gene_mapping <- gene_mapping %>%
+  group_by(symbol) %>%
+  arrange(desc(mean_expr)) %>%
+  slice(1) %>%  # Keep first row (highest expression) for each symbol
+  ungroup()
+```
+```{r}
+# Create new count matrix with unique gene symbols
+count_data_symbols <- count_data[gene_mapping$original_id, ]
+rownames(count_data_symbols) <- gene_mapping$symbol
+
+print(paste("Original genes:", nrow(count_data)))
+print(paste("Genes with unique symbols:", nrow(count_data_symbols)))
+print("Sample of gene symbols:")
+print(head(rownames(count_data_symbols), 20))
+```
+```{r}
+# Check if we have common pancreatic cancer genes
+pancreatic_genes <- c("KRAS", "TP53", "CDKN2A", "SMAD4", "TSPAN8", "AGR2", "POSTN", "TFF1", "CP")
+
+found_genes <- pancreatic_genes[pancreatic_genes %in% rownames(count_data_symbols)]
+
+print(paste("Found pancreatic cancer genes:", paste(found_genes, collapse = ", ")))
+
+```
+```{r}
+# 3. EXTRACT METADATA FROM SERIES_MATRIX FILE
+series_matrix <- readLines("GSE211398_series_matrix.txt")
+
+# Extract sample titles
+sample_title_line <- grep("!Sample_title", series_matrix, value = TRUE)
+sample_titles <- unlist(strsplit(gsub('!Sample_title\t"', '', sample_title_line), '\t'))
+sample_titles <- gsub('"', '', sample_titles)
+
+# Extract sample GEO accessions  
+sample_geo_line <- grep("!Sample_geo_accession", series_matrix, value = TRUE)
+sample_geo <- unlist(strsplit(gsub('!Sample_geo_accession\t"', '', sample_geo_line), '\t'))
+sample_geo <- gsub('"', '', sample_geo)
+
+# Extract characteristics
+characteristics_lines <- grep("!Sample_characteristics_ch1", series_matrix, value = TRUE)
+
+# Parse characteristics
+extract_characteristics <- function(line) {
+  content <- gsub('!Sample_characteristics_ch1\t"', '', line)
+  content <- gsub('"', '', content)
+  unlist(strsplit(content, '\t'))
+}
+
+tissue_info <- extract_characteristics(characteristics_lines[1])
+race_info <- extract_characteristics(characteristics_lines[2])
+gender_info <- extract_characteristics(characteristics_lines[3])
+age_info <- extract_characteristics(characteristics_lines[4])
+```
+
+```{r}
+# Clean and create metadata
+metadata <- data.frame(
+  sample_id = sample_geo,
+  tissue = ifelse(grepl("adenocarcinoma", tissue_info), "Tumor", "NonTumor"),
+  race = gsub("race: ", "", race_info),
+  gender = gsub("gender: ", "", gender_info),
+  age = as.numeric(gsub("age: ", "", age_info)),
+  stringsAsFactors = TRUE
+)
+rownames(metadata) <- metadata$sample_id
+
+# Reorder metadata to match count data
+metadata <- metadata[colnames(count_data_symbols), ]
+
+# Verify metadata
+print("Sample distribution:")
+print(table(metadata$tissue, metadata$race))
+
+head(metadata)
+```
+```{r}
+# Check sample distribution
+sample_summary <- metadata %>%
+  group_by(tissue, race) %>%
+  summarise(
+    n = n(),
+    mean_age = mean(age, na.rm = TRUE),
+    sd_age = sd(age, na.rm = TRUE),
+    .groups = 'drop'
+  )
+print(sample_summary)
+```
+```{r}
+# 4. Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = count_data_symbols,
+  colData = metadata,
+  design = ~ tissue + race + tissue:race
+)
+```
+
+
+```{r}
+# 5. Run DESeq2
+dds <- DESeq(dds)
+```
+
+### 6. ALL KEY COMPARISONS
+```{r}
+## 6a. Tumor vs Non-Tumor (across all races)
+res_tumor_vs_normal <- results(dds, name = "tissue_Tumor_vs_NonTumor")
+sig_tumor <- res_tumor_vs_normal[res_tumor_vs_normal$padj < 0.05 & !is.na(res_tumor_vs_normal$padj), ]
+sig_tumor <- sig_tumor[order(sig_tumor$padj), ]
+
+print(paste("Number of DEGs between tumor and non-tumor:", nrow(sig_tumor)))
+```
+
+
+```{r}
+print("Top 10 tumor vs non-tumor genes:")
+top_tumor_genes <- as.data.frame(head(sig_tumor, 10))
+top_tumor_genes$gene_symbol <- rownames(top_tumor_genes)
+print(top_tumor_genes[, c("gene_symbol", "log2FoldChange", "padj")])
+```
+```{r}
+## 6b. Race effect (across all tissues)
+res_race <- results(dds, name = "race_White_vs_Black")
+sig_race <- res_race[res_race$padj < 0.05 & !is.na(res_race$padj), ]
+sig_race <- sig_race[order(sig_race$padj), ]
+
+
+print(paste("Number of DEGs between races:", nrow(sig_race)))
+
+```
+
+
+```{r}
+print("Top 10 race-associated genes:")
+top_race_genes <- as.data.frame(head(sig_race, 20))
+top_race_genes$gene_symbol <- rownames(top_race_genes)
+print(top_race_genes[, c("gene_symbol", "log2FoldChange", "padj")])
+```
+```{r}
+## 6c. INTERACTION: Does tumor effect differ by race? 
+res_interaction <- results(dds, name = "tissueTumor.raceWhite")
+sig_interaction <- res_interaction[res_interaction$padj < 0.05 & !is.na(res_interaction$padj), ]
+sig_interaction <- sig_interaction[order(sig_interaction$padj), ]
+
+
+print(paste("Number of genes where tumor effect differs by race:", nrow(sig_interaction)))
+```
+
+
+```{r}
+print("Top 10 interaction genes:")
+top_interaction_genes <- as.data.frame(head(sig_interaction, 10))
+top_interaction_genes$gene_symbol <- rownames(top_interaction_genes)
+print(top_interaction_genes[, c("gene_symbol", "log2FoldChange", "padj")])
+
+```
+### VISUALIZING ALL COMPARISONS
+
+```{r}
+## 7a. Volcano plot for Tumor vs Non-Tumor
+volcano_tumor <- as.data.frame(res_tumor_vs_normal)
+volcano_tumor$gene <- rownames(volcano_tumor)
+volcano_tumor$significant <- volcano_tumor$padj < 0.05 & abs(volcano_tumor$log2FoldChange) > 1
+volcano_tumor$significant[is.na(volcano_tumor$significant)] <- FALSE
+
+# Label top genes
+volcano_tumor$label <- ifelse(volcano_tumor$padj < 0.001 & abs(volcano_tumor$log2FoldChange) > 2, 
+                              volcano_tumor$gene, "")
+
+ggplot(volcano_tumor, aes(x = log2FoldChange, y = -log10(pvalue))) +
+  geom_point(aes(color = significant), alpha = 0.6) +
+  geom_text_repel(aes(label = label), size = 3, max.overlaps = 10) +
+  scale_color_manual(values = c("grey", "red")) +
+  labs(title = "Tumor vs Non-Tumor DEGs",
+       x = "Log2 Fold Change (Tumor/NonTumor)",
+       y = "-Log10 P-value") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+```{r}
+## 7b. Volcano plot for Race effect
+volcano_race <- as.data.frame(res_race)
+volcano_race$gene <- rownames(volcano_race)
+volcano_race$significant <- volcano_race$padj < 0.05 & abs(volcano_race$log2FoldChange) > 1
+volcano_race$significant[is.na(volcano_race$significant)] <- FALSE
+
+volcano_race$label <- ifelse(volcano_race$padj < 0.001 & abs(volcano_race$log2FoldChange) > 2, 
+                             volcano_race$gene, "")
+
+ggplot(volcano_race, aes(x = log2FoldChange, y = -log10(pvalue))) +
+  geom_point(aes(color = significant), alpha = 0.6) +
+  geom_text_repel(aes(label = label), size = 3, max.overlaps = 10) +
+  scale_color_manual(values = c("grey", "blue")) +
+  labs(title = "White vs Black DEGs",
+       x = "Log2 Fold Change (White/Black)",
+       y = "-Log10 P-value") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+```{r}
+## 7c. Volcano plot for Interaction
+volcano_interaction <- as.data.frame(res_interaction)
+volcano_interaction$gene <- rownames(volcano_interaction)
+volcano_interaction$significant <- volcano_interaction$padj < 0.05 & abs(volcano_interaction$log2FoldChange) > 1
+volcano_interaction$significant[is.na(volcano_interaction$significant)] <- FALSE
+
+volcano_interaction$label <- ifelse(volcano_interaction$padj < 0.001 & abs(volcano_interaction$log2FoldChange) > 2, 
+                                    volcano_interaction$gene, "")
+
+ggplot(volcano_interaction, aes(x = log2FoldChange, y = -log10(pvalue))) +
+  geom_point(aes(color = significant), alpha = 0.6) +
+  geom_text_repel(aes(label = label), size = 3, max.overlaps = 10) +
+  scale_color_manual(values = c("grey", "purple")) +
+  labs(title = "Interaction: Genes where tumor effect differs by race",
+       x = "Log2 Fold Change (Interaction)",
+       y = "-Log10 P-value") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+### 8. HEATMAPS FOR EACH COMPARISON
+```{r}
+## 8a. Heatmap for Tumor vs Non-Tumor DEGs
+if (nrow(sig_tumor) > 0) {
+  vsd <- vst(dds, blind = FALSE)
+  top_tumor_genes <- rownames(sig_tumor)[1:min(30, nrow(sig_tumor))]
+  mat_tumor <- assay(vsd)[top_tumor_genes, ]
+  mat_tumor <- t(scale(t(mat_tumor)))
+  
+  pheatmap(mat_tumor,
+           annotation_col = metadata[, c("tissue", "race")],
+           main = "Top Tumor vs Non-Tumor DEGs",
+           show_rownames = TRUE,
+           fontsize_row = 8)
+}
+```
+```{r}
+## 8b. Heatmap for Race DEGs
+if (nrow(sig_race) > 0) {
+  top_race_genes <- rownames(sig_race)[1:min(30, nrow(sig_race))]
+  mat_race <- assay(vsd)[top_race_genes, ]
+  mat_race <- t(scale(t(mat_race)))
+  
+  pheatmap(mat_race,
+           annotation_col = metadata[, c("tissue", "race")],
+           main = "Top Race-Associated DEGs",
+           show_rownames = TRUE,
+           fontsize_row = 8)
+}
+```
+```{r}
+## 8c. Heatmap for Interaction genes
+if (nrow(sig_interaction) > 0) {
+  top_interaction_genes <- rownames(sig_interaction)[1:min(30, nrow(sig_interaction))]
+  mat_interaction <- assay(vsd)[top_interaction_genes, ]
+  mat_interaction <- t(scale(t(mat_interaction)))
+  
+  pheatmap(mat_interaction,
+           annotation_col = metadata[, c("tissue", "race")],
+           main = "Top Genes: Tumor Effect Differs by Race",
+           show_rownames = TRUE,
+           fontsize_row = 8)
+}
+```
+```{r}
+# 9. Checking if  SPECIFIC pancreatic GENES are expressed
+genes_to_check <- c("TSPAN8", "AGR2", "POSTN", "TFF1", "CP", "KRAS", "TP53", "CDKN2A", "SMAD4")
+
+print("=== SPECIFIC GENE ANALYSIS ===")
+for (gene in genes_to_check) {
+  if (gene %in% rownames(count_data_symbols)) {
+    # Plot expression
+    plot_data <- plotCounts(dds, gene = gene, intgroup = c("tissue", "race"), returnData = TRUE)
+    
+    p <- ggplot(plot_data, aes(x = tissue, y = count, color = race, shape = race)) +
+      geom_point(position = position_jitter(width = 0.2), size = 3) +
+      labs(title = paste("Expression of", gene),
+           x = "Tissue", y = "Normalized Counts") +
+      theme_minimal()
+    print(p) # Print results for this gene
+    cat("\n---", gene, "---\n")
+    if (gene %in% rownames(res_tumor_vs_normal)) {
+      tumor_result <- res_tumor_vs_normal[gene, ]
+      direction <- ifelse(tumor_result$log2FoldChange > 0, "UP in Tumor", "DOWN in Tumor")
+      cat("Tumor vs Normal: FC =", round(2^tumor_result$log2FoldChange, 2), 
+          "| padj =", format(tumor_result$padj, scientific = TRUE), "|", direction, "\n")
+    }
+    
+    if (gene %in% rownames(res_race)) {
+      race_result <- res_race[gene, ]
+      direction <- ifelse(race_result$log2FoldChange > 0, "UP in White", "UP in Black")
+      cat("Race effect: FC =", round(2^race_result$log2FoldChange, 2), 
+          "| padj =", format(race_result$padj, scientific = TRUE), "|", direction, "\n")
+    }
+    
+    if (gene %in% rownames(res_interaction)) {
+      interaction_result <- res_interaction[gene, ]
+      direction <- ifelse(interaction_result$log2FoldChange > 0, "Stronger in White", "Stronger in Black")
+      cat("Interaction: FC =", round(interaction_result$log2FoldChange, 2), 
+          "| padj =", format(interaction_result$padj, scientific = TRUE), "| Tumor effect", direction, "\n")
+    }
+  } else {
+    cat("\n", gene, "not found in dataset\n")
+  }
+}
+
+```
+```{r}
+# 10. SUMMARY STATISTICS
+print(paste("Tumor vs Non-Tumor DEGs:", nrow(sig_tumor)))
+print(paste("Race-associated DEGs:", nrow(sig_race)))
+print(paste("Genes with different tumor effects by race:", nrow(sig_interaction)))
+```
+```{r}
+# Save results with gene symbols
+write.csv(as.data.frame(sig_tumor), "tumor_vs_normal_deg.csv")
+write.csv(as.data.frame(sig_race), "race_deg.csv")
+write.csv(as.data.frame(sig_interaction), "interaction_genes.csv")
+```
